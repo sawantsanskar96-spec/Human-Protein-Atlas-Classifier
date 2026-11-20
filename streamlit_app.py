@@ -1,12 +1,12 @@
-import io
-import cv2
-import torch
 import numpy as np
-import torch.nn as nn
 import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from PIL import Image
+
+from api_client import check_api_health, predict_via_api
+from cnn_model import load_model as load_classification_model
+from config import API_URL, CLASS_LABELS, DEVICE, NUM_CLASSES, PREDICTION_THRESHOLD
+from preprocessing import decode_channel_bytes, predict_from_channels
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -193,21 +193,6 @@ h1, h2, h3 { font-family: 'Space Mono', monospace !important; }
 """, unsafe_allow_html=True)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-IMG_SIZE    = 128
-NUM_CLASSES = 28
-DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH  = "backend/model/protein_model.pth"
-
-CLASS_LABELS = [
-    "Nucleoplasm", "Nuclear membrane", "Nucleoli", "Nucleoli fibrillar center",
-    "Nuclear speckles", "Nuclear bodies", "Endoplasmic reticulum", "Golgi apparatus",
-    "Peroxisomes", "Endosomes", "Lysosomes", "Intermediate filaments",
-    "Actin filaments", "Focal adhesion sites", "Microtubules", "Microtubule ends",
-    "Cytokinetic bridge", "Mitotic spindle", "Microtubule organizing center",
-    "Centrosome", "Lipid droplets", "Plasma membrane", "Cell junctions",
-    "Mitochondria", "Aggresome", "Cytosol", "Cytoplasmic bodies", "Rods & rings",
-]
-
 CHANNEL_COLORS = {
     "Red (Microtubule)":   ("#ff4b6e", "red"),
     "Green (Protein)":     ("#00e676", "green"),
@@ -215,43 +200,20 @@ CHANNEL_COLORS = {
     "Yellow (ER)":         ("#ffd740", "yellow"),
 }
 
-# ── Model ──────────────────────────────────────────────────────────────────────
-class CustomCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(), nn.Dropout(0.4), nn.Linear(256, NUM_CLASSES)
-        )
-    def forward(self, x):
-        return self.classifier(self.features(x))
-
 @st.cache_resource(show_spinner=False)
 def load_model():
-    m = CustomCNN().to(DEVICE)
-    m.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    m.eval()
-    return m
+    return load_classification_model(device=DEVICE)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def preprocess(uploaded_file):
-    data = np.frombuffer(uploaded_file.read(), np.uint8)
-    img  = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
-    return cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+    return decode_channel_bytes(uploaded_file.read())
 
-def run_inference(channels, threshold):
-    stack  = np.stack(channels, axis=0).astype(np.float32) / 255.0
-    tensor = torch.tensor(stack).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        probs = torch.sigmoid(model(tensor)).cpu().numpy()[0]
-    preds = (probs > threshold).astype(int)
-    return probs, preds
+def run_inference(channels, threshold, channel_files=None):
+    if API_URL:
+        return predict_via_api(API_URL, channel_files or {}, threshold)
+    return predict_from_channels(model, channels, threshold=threshold, device=DEVICE)
 
 def composite_rgb(r, g, b):
     """Merge R/G/B channels into a viewable RGB thumbnail."""
@@ -279,10 +241,15 @@ def prob_bar_chart(probs, preds, threshold):
     plt.tight_layout(pad=1.2)
     return fig
 
-# ── Load model ─────────────────────────────────────────────────────────────────
+backend_name = "FastAPI" if API_URL else "local checkpoint"
 try:
-    model = load_model()
-    model_ok = True
+    if API_URL:
+        model_ok = check_api_health(API_URL)
+        if not model_ok:
+            model_err = f"FastAPI health check failed at {API_URL}"
+    else:
+        model = load_model()
+        model_ok = True
 except Exception as e:
     model_ok = False
     model_err = str(e)
@@ -301,21 +268,24 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     if model_ok:
-        st.markdown("""
+        st.markdown(f"""
         <div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:1.2rem'>
             <span style='width:8px;height:8px;background:#00e676;border-radius:50%;
                          display:inline-block;box-shadow:0 0 6px #00e676'></span>
-            <span style='color:#00e676;font-size:0.82rem;font-weight:600'>Loaded · Ready</span>
+            <span style='color:#00e676;font-size:0.82rem;font-weight:600'>{backend_name} · Ready</span>
+        </div>
+        <div style='color:#6b7280;font-size:0.75rem;line-height:1.5;margin-bottom:1.2rem'>
+            Endpoint: <code style='color:#ffd740'>{API_URL or "local inference"}</code>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
         <div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem'>
             <span style='width:8px;height:8px;background:#ff4b6e;border-radius:50%;display:inline-block'></span>
-            <span style='color:#ff4b6e;font-size:0.82rem;font-weight:600'>Model not found</span>
+            <span style='color:#ff4b6e;font-size:0.82rem;font-weight:600'>Inference backend unavailable</span>
         </div>
         <div style='color:#6b7280;font-size:0.75rem;line-height:1.5'>
-            Train first:<br><code style='color:#ffd740'>python human-protein-classification.py</code>
+            {model_err}<br><code style='color:#ffd740'>{API_URL or "PROTEIN_API_URL is not set"}</code>
         </div>
         """, unsafe_allow_html=True)
 
@@ -328,7 +298,7 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    threshold = st.slider("Prediction threshold", 0.1, 0.9, 0.3, 0.05,
+    threshold = st.slider("Prediction threshold", 0.1, 0.9, float(PREDICTION_THRESHOLD), 0.05,
                           help="Lower = more predictions; higher = more conservative.")
 
     st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
@@ -433,10 +403,24 @@ if all_uploaded:
         run = st.button("🔬  Run Classification", disabled=not model_ok)
 
     if run and model_ok:
-        with st.spinner("Running inference…"):
-            probs, preds = run_inference(
-                [red_arr, green_arr, blue_arr, yellow_arr], threshold
-            )
+        try:
+            with st.spinner("Running inference…"):
+                probs, preds = run_inference(
+                    [red_arr, green_arr, blue_arr, yellow_arr],
+                    threshold,
+                    {
+                        "red": red_file,
+                        "green": green_file,
+                        "blue": blue_file,
+                        "yellow": yellow_file,
+                    },
+                )
+        except Exception as e:
+            st.error(f"Inference failed: {e}")
+            st.stop()
+
+        probs = np.asarray(probs, dtype=np.float32)
+        preds = np.asarray(preds, dtype=np.int64)
 
         n_detected = int(preds.sum())
         top_idx    = int(np.argmax(probs))
@@ -550,7 +534,7 @@ if all_uploaded:
             plt.close(fig_top5)
 
             # ── All 28 classes expander (native Streamlit — safe) ──────────────
-            with st.expander("Show all 28 classes"):
+            with st.expander(f"Show all {NUM_CLASSES} classes"):
                 sorted_idx = np.argsort(probs)[::-1]
                 for idx in sorted_idx:
                     active     = preds[idx] == 1
