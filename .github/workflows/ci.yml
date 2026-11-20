@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-mlops.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-mlops.txt
+
+      - name: Compile all Python sources
+        run: python -m compileall -q app.py api_client.py cnn_model.py config.py preprocessing.py tracking.py streamlit_app.py human-protein-classification.py tests scripts
+
+      - name: Validate preprocessing and model loading
+        run: python -m pytest -q tests/test_preprocessing.py tests/test_model.py tests/test_tracking.py
+
+      - name: Test FastAPI health and prediction endpoints
+        run: python -m pytest -q tests/test_api.py
+
+      - name: Verify MLflow smoke experiment
+        run: python scripts/mlflow_smoke_test.py --runs 1 --epochs 1 --batch-size 2 --samples 8 --tracking-uri sqlite:///ci-mlflow.db --experiment hpa-ci-smoke
+
+  docker-build:
+    name: Build Docker images
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build FastAPI image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: api
+          push: false
+          tags: human-protein-atlas-classifier:api-ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Streamlit image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: streamlit
+          push: false
+          tags: human-protein-atlas-classifier:streamlit-ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build MLflow image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: mlflow
+          push: false
+          tags: human-protein-atlas-classifier:mlflow-ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

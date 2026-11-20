@@ -1,57 +1,32 @@
-import io
-import cv2
-import torch
 import numpy as np
-import torch.nn as nn
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import uvicorn
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
-import uvicorn
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-IMG_SIZE   = 128
-NUM_CLASSES = 28
-DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "backend/model/protein_model.pth"
+import tracking
+from config import (
+    API_HOST,
+    API_PORT,
+    API_RELOAD,
+    CLASS_LABELS,
+    DEVICE,
+    IMG_SIZE,
+    MLFLOW_RUN_ID,
+    MODEL_PATH,
+    NUM_CLASSES,
+    PREDICTION_THRESHOLD,
+)
+from preprocessing import decode_channel_bytes, predict_from_channels
 
-# Human Protein Atlas — 28 class labels
-CLASS_LABELS = [
-    "Nucleoplasm", "Nuclear membrane", "Nucleoli", "Nucleoli fibrillar center",
-    "Nuclear speckles", "Nuclear bodies", "Endoplasmic reticulum", "Golgi apparatus",
-    "Peroxisomes", "Endosomes", "Lysosomes", "Intermediate filaments",
-    "Actin filaments", "Focal adhesion sites", "Microtubules", "Microtubule ends",
-    "Cytokinetic bridge", "Mitotic spindle", "Microtubule organizing center",
-    "Centrosome", "Lipid droplets", "Plasma membrane", "Cell junctions",
-    "Mitochondria", "Aggresome", "Cytosol", "Cytoplasmic bodies", "Rods & rings",
-]
-
-# ── Model definition (must match training) ────────────────────────────────────
-class CustomCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(), nn.Dropout(0.4), nn.Linear(256, NUM_CLASSES)
-        )
-
-    def forward(self, x):
-        return self.classifier(self.features(x))
-
-# ── Load model ─────────────────────────────────────────────────────────────────
-model = CustomCNN().to(DEVICE)
+# ── Model definition (shared with training: cnn_model.CustomCNN) ──────────────
 try:
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    model.eval()
-    print(f"✅  Model loaded from {MODEL_PATH}")
-except FileNotFoundError:
-    raise RuntimeError(f"Model file not found at '{MODEL_PATH}'. Train the model first.")
+    model = tracking.load_inference_model(MLFLOW_RUN_ID or None)
+    source = f"MLflow run {MLFLOW_RUN_ID}" if MLFLOW_RUN_ID else MODEL_PATH
+    print(f"Model loaded from {source}")
+except Exception as exc:
+    raise RuntimeError(f"Model could not be loaded. {exc}") from exc
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -70,27 +45,21 @@ app.add_middleware(
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def decode_image(file_bytes: bytes) -> np.ndarray:
     """Decode uploaded PNG/JPG bytes → grayscale numpy array (IMG_SIZE × IMG_SIZE)."""
-    arr = np.frombuffer(file_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image. Ensure it is a valid PNG/JPG.")
-    return cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    try:
+        return decode_channel_bytes(file_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-def predict(channels: List[np.ndarray], threshold: float = 0.3):
+
+def predict(channels: List[np.ndarray], threshold: float = PREDICTION_THRESHOLD):
     """Stack 4 channels → tensor → model → probabilities & predictions."""
-    image = np.stack(channels, axis=0).astype(np.float32) / 255.0
-    tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        logits = model(tensor)
-        probs  = torch.sigmoid(logits).cpu().numpy()[0]
-    preds = (probs > threshold).astype(int)
-    return probs.tolist(), preds.tolist()
+    return predict_from_channels(model, channels, threshold=threshold, device=DEVICE)
 
 # ── Response schema ────────────────────────────────────────────────────────────
 class PredictionResponse(BaseModel):
     predicted_classes: List[str]
     class_indices: List[int]
-    probabilities: dict          # label → probability
+    probabilities: dict
     threshold_used: float
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -113,7 +82,7 @@ async def predict_endpoint(
     green:  UploadFile = File(..., description="Green-channel PNG"),
     blue:   UploadFile = File(..., description="Blue-channel PNG"),
     yellow: UploadFile = File(..., description="Yellow-channel PNG"),
-    threshold: float = 0.3,
+    threshold: float = PREDICTION_THRESHOLD,
 ):
     """
     Upload 4 single-channel fluorescence images (red, green, blue, yellow)
@@ -142,4 +111,4 @@ async def predict_endpoint(
 
 # ── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host=API_HOST, port=API_PORT, reload=API_RELOAD)

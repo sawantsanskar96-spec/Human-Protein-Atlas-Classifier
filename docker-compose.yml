@@ -1,0 +1,68 @@
+services:
+  fastapi:
+    build:
+      context: .
+      target: api
+    image: human-protein-atlas-classifier:api
+    ports:
+      - "8000:8000"
+    environment:
+      PROTEIN_DEVICE: cpu
+      PROTEIN_MODEL_PATH: /app/model/protein_model.pth
+      PROTEIN_API_HOST: 0.0.0.0
+      PROTEIN_API_PORT: "8000"
+      PROTEIN_API_RELOAD: "0"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  streamlit:
+    build:
+      context: .
+      target: streamlit
+    image: human-protein-atlas-classifier:streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      PROTEIN_API_URL: http://fastapi:8000
+      PROTEIN_DEVICE: cpu
+      PROTEIN_MODEL_PATH: /app/model/protein_model.pth
+    depends_on:
+      fastapi:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  mlflow:
+    profiles:
+      - mlflow
+    build:
+      context: .
+      target: mlflow
+    image: human-protein-atlas-classifier:mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_TRACKING_URI: sqlite:////app/mlflow_data/mlflow.db
+      MLFLOW_EXPERIMENT_NAME: human-protein-atlas-classifier
+    volumes:
+      - mlflow-data:/app/mlflow_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  mlflow-data:
